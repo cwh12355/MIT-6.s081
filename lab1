@@ -1,1 +1,251 @@
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  if(argc != 2) {
+    fprintf(2, "usage: sleep ticks\n");
+    exit();
+  }
+  sleep(atoi(argv[1]));
+  exit();
+}
+
+
+pingpong.c
+
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(void) 
+{
+  int parent_fd[2], child_fd[2];
+  char buf, msg = '0';
+  
+  pipe(parent_fd);
+  pipe(child_fd);
+  if (fork() == 0) {
+    read(parent_fd[0], &buf, 1);
+    printf("%d: received ping\n", getpid());
+    write(child_fd[1], &msg, 1);        
+  } else {
+    write(parent_fd[1], &msg, 1);
+    read(child_fd[0], &buf, 1);
+    printf("%d: received pong\n", getpid());
+  }
+  exit();
+}
+
+
+primer.c
+
+#include "kernel/types.h"
+#include "user/user.h"
+
+void
+close_pipe(int *p) {
+  close(p[0]);
+  close(p[1]);
+}
+
+void
+primes() {
+  int n, p, len;
+  int fd[2];
+
+  // read from prev progress 
+  if ((len = read(0, &n, sizeof(int))) <= 0 || n <= 0) {
+    close(1);
+    exit();
+  }
+  // write first prime to console
+  printf("prime %d\n", n);
+  
+  pipe(fd);
+  if (fork() == 0) {
+    close(0);
+    dup(fd[0]);
+    close_pipe(fd);
+    primes();
+  } else {
+    close(1);
+    dup(fd[1]);
+    close_pipe(fd);
+    while ((len = read(0, &p, sizeof(int))) > 0 && p > 0) {
+      if (p % n != 0) {
+        write(1, &p, sizeof(int));
+      }
+    }
+    if (len <= 0 || p <= 0) {
+      close(1);
+      exit();
+    }
+  } 
+}
+
+int
+main(void) {
+  int i;
+  int fd[2];
+  
+  pipe(fd);
+  if (fork() == 0) {
+    close(0);
+    dup(fd[0]);
+    close_pipe(fd);
+    primes();
+  } else {
+    close(1);
+    dup(fd[1]);
+    close_pipe(fd);
+    for (i = 2; i <= 35; i++) {
+      write(1, &i, sizeof(int));
+    }
+    close(1);
+    wait();
+  }
+  exit();
+}
+
+
+find.c
+
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/fs.h"
+
+void
+find(char *path, char *re) 
+{
+  char buf[512], *p;
+  int fd;
+  struct dirent de;
+  struct stat st;
+
+  // open the dir
+  if((fd = open(path, 0)) < 0){
+    fprintf(2, "find: cannot open %s\n", path);
+    return;
+  }
+  if(fstat(fd, &st) < 0 || T_DIR != st.type){
+    fprintf(2, "find: the first arg must be dir path\n");
+    close(fd);
+    return;
+  }
+  // descent into sub-dir
+  while(read(fd, &de, sizeof(de)) == sizeof(de)) {
+    // splice current path
+    strcpy(buf, path);
+    p = buf + strlen(buf);
+    *p++ = '/';
+    if(de.inum == 0) {
+      continue;
+    }
+    memmove(p, de.name, DIRSIZ);
+    p[DIRSIZ] = 0;
+    if(stat(buf, &st) < 0){
+      printf("find: cannot stat %s\n", buf);
+      continue;
+    }
+    switch(st.type) {
+      case T_FILE:
+        if (strcmp(re, de.name) == 0) {
+          printf("%s\n", buf);
+        }
+        break;
+      case T_DIR:
+        // recursion
+        if (strcmp(de.name, ".") != 0 && strcmp(de.name, "..") != 0) {
+          find(buf, re);
+        }
+        break;
+      }
+  }
+  close(fd);
+}
+
+int
+main(int argc, char *argv[])
+{
+  if(argc < 3){
+    fprintf(2, "usage: find <path> <expression>\n");
+    exit();
+  }
+  find(argv[1], argv[2]);
+  exit();
+}
+
+
+
+xargs.c
+
+#include "kernel/types.h"
+#include "kernel/param.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  int i, j, pid, len;
+  int first_blank;
+  char args[MAXARG][32];
+  char *p[MAXARG];
+  char buf;
+
+  if(argc < 2) {
+    fprintf(2, "usage: xargs <cmd> ...\n");
+    exit();
+  }
+  while (1)
+  {
+    // init
+    i = 0;
+    first_blank = 0;
+    memset(args, 0, MAXARG * 32);
+
+    // push command args and stdin args together
+    // the first arg must be command itself
+    for(j = 1; j < argc; j++) {
+      strcpy(args[i++], argv[j]);
+    }
+    j = 0;  
+    while (i < MAXARG-1) {
+      if ((len = read(0, &buf, 1)) <= 0) {
+        // CTRL+D 
+        wait(); 
+        exit();
+      }
+      if (buf == '\n') {
+        break;
+      }
+      if (buf == ' ') {
+        if (first_blank) {
+          i++;
+          j = 0;
+          first_blank = 0;
+        }
+        continue;
+      }
+      args[i][j++] = buf;
+      first_blank = 1;
+    }
+    for (i = 0; i < MAXARG-1; i++) {
+      p[i] = args[i];
+    }
+    // the last arg must be 0
+    p[MAXARG-1] = 0;
+    
+    // exec command
+    if ((pid = fork()) == 0) {
+      exec(argv[1], p);
+      exit();
+    }
+  }
+  exit();
+}
+
+
 
